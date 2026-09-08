@@ -1,0 +1,9 @@
+# SynXS Data Processing Suite - core dependencies
+numpy>=1.20
+matplotlib>=3.4
+scipy>=1.6
+fabio>=0.10
+pyfai>=0.20
+
+# Optional: interactive 3D plotting engine
+# pyvista>=0.38
