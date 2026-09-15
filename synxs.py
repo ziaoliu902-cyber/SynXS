@@ -114,6 +114,7 @@ import fabio
 import pyFAI
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.signal import find_peaks
+from scipy.optimize import curve_fit
 
 # ===== Disable PyFAI OpenCL acceleration to prevent GPU instability and crashes =====
 pyFAI.use_opencl = False
@@ -4399,6 +4400,511 @@ class DataProcessTab(ttk.Frame):
             messagebox.showinfo("Complete", f"Batch processing complete! {success_count} files succeeded.")
 
 # ====================== Data processing tool main window (Toplevel) ======================
+class CrystallinityTab(ttk.Frame):
+    """
+    WAXS Crystallinity Index Tool.
+
+    Deconvolves one broad amorphous halo plus N sharper crystalline Bragg
+    peaks from a 1D WAXS I(q) curve (Gaussian components fitted with
+    scipy.optimize.curve_fit) and reports the crystallinity index
+    CI (%) = area(crystalline peaks) / area(total). Supports single-file
+    preview and batch processing across a file series (e.g. a UV-exposure
+    time series), with CSV + PDF report export.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_paths = []
+        self.current_data = None      # (q, I)
+        self.current_file = ""
+        self.results = {}             # filepath -> dict(ci, popt, q, I)
+        self.init_ui()
+
+    def init_ui(self):
+        top_frame = ttk.LabelFrame(self, text="Crystallinity fit parameters", padding=10)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(top_frame, text="Number of crystalline peaks:").grid(row=0, column=0, sticky=tk.W)
+        self.npeaks_entry = ttk.Entry(top_frame, width=6)
+        self.npeaks_entry.grid(row=0, column=1, padx=5)
+        self.npeaks_entry.insert(0, "2")
+
+        ttk.Label(top_frame, text="Amorphous halo center (q):").grid(row=0, column=2, sticky=tk.W, padx=(20, 0))
+        self.halo_center_entry = ttk.Entry(top_frame, width=8)
+        self.halo_center_entry.grid(row=0, column=3, padx=5)
+        self.halo_center_entry.insert(0, "1.4")
+
+        ttk.Label(top_frame, text="Amorphous halo width guess:").grid(row=0, column=4, sticky=tk.W, padx=(20, 0))
+        self.halo_width_entry = ttk.Entry(top_frame, width=8)
+        self.halo_width_entry.grid(row=0, column=5, padx=5)
+        self.halo_width_entry.insert(0, "0.4")
+
+        ttk.Label(top_frame,
+                  text="*Fits amorphous halo + N crystalline Gaussian peaks; CI = crystalline area / total area",
+                  foreground="gray").grid(row=1, column=0, columnspan=6, sticky=tk.W, pady=(5, 0))
+
+        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        left_frame = ttk.Frame(main_pane, width=250)
+        main_pane.add(left_frame, weight=1)
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(right_frame, weight=3)
+
+        ttk.Label(left_frame, text="Imported WAXS files:").pack(anchor=tk.W)
+        self.file_listbox = tk.Listbox(left_frame, height=14, font=('Helvetica', 10))
+        self.file_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
+
+        btn_frame = ttk.Frame(left_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="Import files", command=self.import_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Clear list", command=self.clear_list).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(left_frame, text="Preview fit (current file)", command=self.preview_fit).pack(fill=tk.X, pady=2)
+        ttk.Button(left_frame, text="One-click CI (all files)", command=self.batch_compute).pack(fill=tk.X, pady=2)
+        ttk.Button(left_frame, text="Export results (CSV + PDF report)",
+                   command=self.export_report).pack(fill=tk.X, pady=2)
+
+        self.status_label = ttk.Label(left_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.pack(fill=tk.X, pady=5)
+
+        self.figure, self.ax = plt.subplots(figsize=(7, 5))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=right_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.ax.set_title("Import a WAXS .dat file and preview")
+        self.ax.set_xlabel("q (Å⁻¹)")
+        self.ax.set_ylabel("Intensity (a.u.)")
+        self.figure.tight_layout()
+
+    # ---------- file I/O ----------
+    def import_files(self):
+        paths = filedialog.askopenfilenames(title="Select WAXS .dat files",
+                                             filetypes=[("Data files", "*.dat *.txt *.csv"), ("All files", "*.*")])
+        for p in paths:
+            if p not in self.file_paths:
+                self.file_paths.append(p)
+                self.file_listbox.insert(tk.END, os.path.basename(p))
+        self.status_label.config(text=f"{len(self.file_paths)} file(s) loaded")
+
+    def clear_list(self):
+        self.file_paths = []
+        self.file_listbox.delete(0, tk.END)
+        self.results = {}
+        self.status_label.config(text="Ready")
+
+    def load_curve(self, path):
+        arr = np.loadtxt(path, comments=('#', '"'))
+        q, I = arr[:, 0], arr[:, 1]
+        order = np.argsort(q)
+        return q[order], I[order]
+
+    def on_file_select(self, event):
+        sel = self.file_listbox.curselection()
+        if not sel:
+            return
+        path = self.file_paths[sel[0]]
+        self.current_file = path
+        try:
+            self.current_data = self.load_curve(path)
+            self.draw_current(fit=None)
+        except Exception as e:
+            messagebox.showerror("Load error", f"Could not read {path}:\n{e}")
+
+    # ---------- fitting ----------
+    def _get_params(self):
+        n_peaks = int(self.npeaks_entry.get())
+        halo_c = float(self.halo_center_entry.get())
+        halo_w = float(self.halo_width_entry.get())
+        return n_peaks, halo_c, halo_w
+
+    def fit_crystallinity(self, q, I, n_cryst_peaks, halo_center_guess, halo_width_guess,
+                          warn=True):
+        """
+        Fit amorphous halo + N crystalline Gaussians.
+
+        Initial-value strategy:
+        - Candidate crystalline peaks come from find_peaks, EXCLUDING peaks
+          that fall inside the amorphous halo zone (within ~1 halo width of
+          the halo center), so the halo itself is not mistaken for a Bragg
+          peak.
+        - If fewer distinct candidates than requested peaks are found (e.g.
+          a fully amorphous sample), placeholder components start with small
+          amplitude spread evenly over the q range (instead of stacked at
+          q.mean(), which made the fit degenerate), and a warning is raised.
+        Returns (ci_percent, popt, n_candidates_found).
+        """
+        peak_idx, _ = find_peaks(I, prominence=(I.max() - I.min()) * 0.05)
+        if len(peak_idx):
+            halo_zone = np.abs(q[peak_idx] - halo_center_guess) < max(halo_width_guess, 0.05)
+            cryst_idx = peak_idx[~halo_zone]
+        else:
+            cryst_idx = peak_idx
+        if len(cryst_idx) > n_cryst_peaks:
+            cryst_idx = cryst_idx[np.argsort(I[cryst_idx])[-n_cryst_peaks:]]
+        cryst_idx = np.sort(cryst_idx)
+
+        if len(cryst_idx) < n_cryst_peaks and warn:
+            messagebox.showwarning(
+                "Few crystalline peaks detected",
+                f"Only {len(cryst_idx)} candidate crystalline peak(s) found away from the "
+                f"amorphous halo (requested {n_cryst_peaks}).\n\n"
+                "The sample may be fully amorphous, or try reducing 'Number of crystalline peaks'.\n"
+                "Remaining components start near zero amplitude - check the preview fit carefully.")
+
+        p0 = [I.max() * 0.5, halo_center_guess, halo_width_guess]
+        lo = [0, q.min(), 0.01]
+        hi = [I.max() * 2, q.max(), (q.max() - q.min())]
+        for idx in list(cryst_idx[:n_cryst_peaks]):
+            p0 += [I[idx], q[idx], 0.03]
+            lo += [0, q.min(), 0.005]
+            hi += [I.max() * 2, q.max(), 0.3]
+        # Placeholder components for missing candidates: spread evenly over
+        # the q range with small amplitude (near-zero lower bound lets the
+        # fit collapse them harmlessly instead of diverging).
+        n_fill = n_cryst_peaks - len(cryst_idx[:n_cryst_peaks])
+        if n_fill > 0:
+            span = q.max() - q.min()
+            for j in range(n_fill):
+                frac = (j + 1) / (n_fill + 1)
+                p0 += [I.max() * 0.05, q.min() + frac * span, max(0.03, span * 0.02)]
+                lo += [0, q.min(), 0.005]
+                hi += [I.max() * 2, q.max(), 0.3]
+
+        popt, _ = curve_fit(self._multi_gaussian, q, I, p0=p0, bounds=(lo, hi), maxfev=20000)
+        dq = np.mean(np.diff(q))
+        total_area = 0.0
+        crystalline_area = 0.0
+        for i in range(0, len(popt), 3):
+            area = self._gaussian(q, *popt[i:i + 3]).sum() * dq
+            total_area += area
+            if i > 0:
+                crystalline_area += area
+        ci = 100.0 * crystalline_area / total_area
+        return ci, popt, len(cryst_idx)
+
+    @staticmethod
+    def _gaussian(x, amp, cen, wid):
+        return amp * np.exp(-0.5 * ((x - cen) / wid) ** 2)
+
+    def _multi_gaussian(self, x, *params):
+        y = np.zeros_like(x)
+        for i in range(0, len(params), 3):
+            y += self._gaussian(x, params[i], params[i + 1], params[i + 2])
+        return y
+
+    def draw_current(self, fit):
+        self.ax.clear()
+        q, I = self.current_data
+        self.ax.plot(q, I, 'k.', ms=3, label="data")
+        if fit is not None:
+            ci, popt = fit
+            self.ax.plot(q, self._gaussian(q, *popt[0:3]), '--', color='tab:blue', label="amorphous halo")
+            total = self._gaussian(q, *popt[0:3]).copy()
+            for i in range(3, len(popt), 3):
+                comp = self._gaussian(q, *popt[i:i + 3])
+                total += comp
+                self.ax.plot(q, comp, '--', color='tab:red', alpha=0.7)
+            self.ax.plot(q, total, '-', color='tab:green', label="total fit")
+            self.ax.set_title(f"{os.path.basename(self.current_file)}   CI = {ci:.1f}%")
+        else:
+            self.ax.set_title(os.path.basename(self.current_file) if self.current_file else "")
+        self.ax.set_xlabel("q (Å⁻¹)")
+        self.ax.set_ylabel("Intensity (a.u.)")
+        self.ax.legend(fontsize=8)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def preview_fit(self):
+        if self.current_data is None:
+            messagebox.showwarning("No file", "Select a file first.")
+            return
+        try:
+            n_peaks, halo_c, halo_w = self._get_params()
+            q, I = self.current_data
+            ci, popt, _ = self.fit_crystallinity(q, I, n_peaks, halo_c, halo_w)
+            self.draw_current(fit=(ci, popt))
+            self.status_label.config(text=f"CI = {ci:.1f}%")
+        except Exception as e:
+            messagebox.showerror("Fit error", str(e))
+
+    def batch_compute(self):
+        if not self.file_paths:
+            messagebox.showwarning("No files", "Import files first.")
+            return
+        n_peaks, halo_c, halo_w = self._get_params()
+        self.results = {}
+        failed = []
+        few_candidates = []
+        for i, path in enumerate(self.file_paths):
+            try:
+                q, I = self.load_curve(path)
+                ci, popt, ncand = self.fit_crystallinity(q, I, n_peaks, halo_c, halo_w,
+                                                         warn=False)
+                if ncand < n_peaks:
+                    few_candidates.append(os.path.basename(path))
+                self.results[path] = {'ci': ci, 'popt': popt, 'q': q, 'I': I}
+            except Exception as e:
+                failed.append((path, str(e)))
+            self.status_label.config(text=f"Processing {i + 1}/{len(self.file_paths)}...")
+            self.update_idletasks()
+        msg = f"Done: {len(self.results)} succeeded"
+        if failed:
+            msg += f", {len(failed)} failed"
+        self.status_label.config(text=msg)
+        if few_candidates:
+            preview = ", ".join(few_candidates[:5])
+            more = f" ... (+{len(few_candidates) - 5} more)" if len(few_candidates) > 5 else ""
+            messagebox.showwarning(
+                "Few crystalline peaks in some files",
+                f"{len(few_candidates)} file(s) had fewer crystalline peak candidates than "
+                f"requested ({n_peaks});\nthey may be fully amorphous and their CI values "
+                f"should be treated with caution:\n{preview}{more}")
+        if failed:
+            messagebox.showwarning("Some files failed", "\n".join(f"{os.path.basename(p)}: {e}" for p, e in failed))
+
+    def export_report(self):
+        if not self.results:
+            messagebox.showwarning("No results", "Run batch CI computation first.")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                                   filetypes=[("PDF report", "*.pdf")])
+        if not save_path:
+            return
+        csv_path = os.path.splitext(save_path)[0] + "_CI_summary.csv"
+        with open(csv_path, 'w') as f:
+            f.write("filename,crystallinity_index_percent\n")
+            for path, r in self.results.items():
+                f.write(f"{os.path.basename(path)},{r['ci']:.3f}\n")
+
+        pdf = PdfPages(save_path)
+        try:
+            for path, r in self.results.items():
+                fig, ax = plt.subplots(figsize=(7, 5))
+                q, I, popt, ci = r['q'], r['I'], r['popt'], r['ci']
+                ax.plot(q, I, 'k.', ms=3, label="data")
+                total = self._gaussian(q, *popt[0:3]).copy()
+                ax.plot(q, total, '--', color='tab:blue', label="amorphous halo")
+                for i in range(3, len(popt), 3):
+                    comp = self._gaussian(q, *popt[i:i + 3])
+                    total = total + comp
+                    ax.plot(q, comp, '--', color='tab:red', alpha=0.7)
+                ax.plot(q, total, '-', color='tab:green', label="total fit")
+                ax.set_title(f"{os.path.basename(path)}   CI = {ci:.1f}%")
+                ax.set_xlabel("q (Å⁻¹)")
+                ax.set_ylabel("Intensity (a.u.)")
+                ax.legend(fontsize=8)
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+
+            names = [os.path.basename(p) for p in self.results]
+            cis = [r['ci'] for r in self.results.values()]
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.bar(range(len(names)), cis, color='tab:blue')
+            ax.set_xticks(range(len(names)))
+            ax.set_xticklabels(names, rotation=45, ha='right', fontsize=7)
+            ax.set_ylabel("Crystallinity index (%)")
+            ax.set_title("Crystallinity index summary")
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+        finally:
+            pdf.close()
+        messagebox.showinfo("Export complete", f"Saved:\n{save_path}\n{csv_path}")
+
+
+class KineticsTab(ttk.Frame):
+    """
+    Structural Degradation Kinetics Tool.
+
+    Fits a time (or dose) series of a structural parameter -- typically the
+    crystallinity index from the Crystallinity tab, but any two-column
+    time/value series is accepted -- to first-order decay kinetics
+    y(t) = A * exp(-k*t) + C, returning the rate constant k, half-life, and
+    R^2 of the fit.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.t_values = []
+        self.y_values = []
+        self.fit_result = None
+        self.init_ui()
+
+    def init_ui(self):
+        top_frame = ttk.LabelFrame(self, text="Time series input", padding=10)
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Button(top_frame, text="Load CSV (time, value)",
+                   command=self.load_csv).grid(row=0, column=0, padx=5)
+        ttk.Button(top_frame, text="Add row manually",
+                   command=self.add_row_dialog).grid(row=0, column=1, padx=5)
+        ttk.Button(top_frame, text="Clear all",
+                   command=self.clear_all).grid(row=0, column=2, padx=5)
+        ttk.Label(top_frame, text="Model: y(t) = A·exp(−k·t) + C",
+                  foreground="gray").grid(row=0, column=3, padx=(20, 0))
+
+        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        left_frame = ttk.Frame(main_pane, width=250)
+        main_pane.add(left_frame, weight=1)
+        right_frame = ttk.Frame(main_pane)
+        main_pane.add(right_frame, weight=3)
+
+        ttk.Label(left_frame, text="Data points (time, value):").pack(anchor=tk.W)
+        self.data_listbox = tk.Listbox(left_frame, height=14, font=('Helvetica', 10))
+        self.data_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        ttk.Button(left_frame, text="Run kinetics fit", command=self.run_fit).pack(fill=tk.X, pady=2)
+        ttk.Button(left_frame, text="Export plot + summary",
+                   command=self.export_results).pack(fill=tk.X, pady=2)
+
+        self.result_text = tk.Text(left_frame, height=8, font=('Helvetica', 10), wrap=tk.WORD)
+        self.result_text.pack(fill=tk.X, pady=5)
+        self.result_text.insert(tk.END, "Fit results will appear here.")
+        self.result_text.config(state=tk.DISABLED)
+
+        self.status_label = ttk.Label(left_frame, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.pack(fill=tk.X, pady=5)
+
+        self.figure, self.ax = plt.subplots(figsize=(7, 5))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=right_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.ax.set_title("Load or enter a time series")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Structural parameter")
+        self.figure.tight_layout()
+
+    def load_csv(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(title="Select CSV (time,value)",
+                                               filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            # Auto-detect header: skip first row only if it is non-numeric
+            # (previously a fixed skip_header=1 silently dropped the first
+            #  data row of header-less CSV files).
+            with open(path, 'r', errors='replace') as f:
+                first_line = f.readline()
+            fields = [p.strip() for p in first_line.split(',')]
+            try:
+                float(fields[0])
+                float(fields[1] if len(fields) > 1 else fields[0])
+                has_header = False
+            except (ValueError, IndexError):
+                has_header = True
+            arr = np.genfromtxt(path, delimiter=',',
+                                skip_header=1 if has_header else 0)
+            if arr.ndim != 2 or arr.shape[1] < 2:
+                raise ValueError("CSV must contain at least two columns (time, value).")
+            arr = arr[~np.isnan(arr).any(axis=1)]
+            if len(arr) == 0:
+                raise ValueError("No numeric data rows found.")
+            self.t_values = list(arr[:, 0])
+            self.y_values = list(arr[:, 1])
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+
+    def add_row_dialog(self):
+        t = simpledialog.askfloat("Time", "Enter time/dose value:")
+        if t is None:
+            return
+        y = simpledialog.askfloat("Value", "Enter structural parameter value:")
+        if y is None:
+            return
+        self.t_values.append(t)
+        self.y_values.append(y)
+        self._refresh_list()
+
+    def clear_all(self):
+        self.t_values = []
+        self.y_values = []
+        self.fit_result = None
+        self._refresh_list()
+
+    def _refresh_list(self):
+        self.data_listbox.delete(0, tk.END)
+        for t, y in zip(self.t_values, self.y_values):
+            self.data_listbox.insert(tk.END, f"t={t:g}   y={y:g}")
+        self._draw()
+
+    @staticmethod
+    def _model(t, A, k, C):
+        return A * np.exp(-k * t) + C
+
+    def run_fit(self):
+        if len(self.t_values) < 4:
+            messagebox.showwarning("Not enough data", "Need at least 4 points to fit 3 parameters.")
+            return
+        t = np.array(self.t_values, dtype=float)
+        y = np.array(self.y_values, dtype=float)
+        order = np.argsort(t)
+        t, y = t[order], y[order]
+        A0 = y[0] - y[-1]
+        C0 = y[-1]
+        k0 = 1.0 / (t[-1] - t[0] + 1e-6)
+        try:
+            popt, pcov = curve_fit(self._model, t, y, p0=[A0, k0, C0], maxfev=20000)
+        except Exception as e:
+            messagebox.showerror("Fit error", str(e))
+            return
+        A, k, C = popt
+        half_life = np.log(2) / k if k > 0 else np.inf
+        y_pred = self._model(t, *popt)
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        self.fit_result = {'t': t, 'y': y, 'popt': popt, 'half_life': half_life, 'r2': r2}
+
+        self.result_text.config(state=tk.NORMAL)
+        self.result_text.delete('1.0', tk.END)
+        self.result_text.insert(tk.END,
+            f"A = {A:.4g}\nk = {k:.4g} (per time unit)\nC = {C:.4g}\n"
+            f"Half-life t1/2 = {half_life:.4g}\nR² = {r2:.4f}")
+        self.result_text.config(state=tk.DISABLED)
+        self._draw()
+        self.status_label.config(text="Fit complete")
+
+    def _draw(self):
+        self.ax.clear()
+        if self.t_values:
+            self.ax.plot(self.t_values, self.y_values, 'ko', ms=6, label="data")
+        if self.fit_result is not None:
+            t, y, popt = self.fit_result['t'], self.fit_result['y'], self.fit_result['popt']
+            t_fine = np.linspace(t.min(), t.max(), 200)
+            self.ax.plot(t_fine, self._model(t_fine, *popt), '-', color='tab:red',
+                         label=f"fit (k={popt[1]:.3g}, R²={self.fit_result['r2']:.3f})")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Structural parameter")
+        self.ax.legend(fontsize=8)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def export_results(self):
+        if self.fit_result is None:
+            messagebox.showwarning("No fit", "Run the kinetics fit first.")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                                   filetypes=[("PDF", "*.pdf"), ("PNG", "*.png")])
+        if not save_path:
+            return
+        self.figure.savefig(save_path, dpi=300)
+        txt_path = os.path.splitext(save_path)[0] + "_summary.txt"
+        A, k, C = self.fit_result['popt']
+        with open(txt_path, 'w') as f:
+            f.write("First-order kinetics fit: y(t) = A*exp(-k*t) + C\n")
+            f.write(f"A = {A:.6g}\nk = {k:.6g}\nC = {C:.6g}\n")
+            f.write(f"Half-life = {self.fit_result['half_life']:.6g}\n")
+            f.write(f"R^2 = {self.fit_result['r2']:.6f}\n")
+        messagebox.showinfo("Export complete", f"Saved:\n{save_path}\n{txt_path}")
+
+
 class DataProcessorApp(tk.Toplevel):
     def __init__(self, master=None):
         super().__init__(master)
@@ -4421,10 +4927,14 @@ class DataProcessorApp(tk.Toplevel):
         self.tab_q2theta = Q2ThetaTab(self.notebook)
         self.tab_peak = PeakFinderTab(self.notebook)
         self.tab_process = DataProcessTab(self.notebook)
+        self.tab_crystallinity = CrystallinityTab(self.notebook)
+        self.tab_kinetics = KineticsTab(self.notebook)
 
         self.notebook.add(self.tab_q2theta, text="Q→2θ Conversion")
         self.notebook.add(self.tab_peak, text="Auto Peak Finder + Report")
         self.notebook.add(self.tab_process, text="Data Processing (Multi-function)")
+        self.notebook.add(self.tab_crystallinity, text="WAXS Crystallinity Index")
+        self.notebook.add(self.tab_kinetics, text="Degradation Kinetics")
 
         # On close, return to main window
         self.protocol("WM_DELETE_WINDOW", self.on_close)

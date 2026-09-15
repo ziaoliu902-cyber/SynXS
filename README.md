@@ -28,6 +28,8 @@
 ### 3. Data Processing Tool
 - **Q → 2θ conversion** (custom wavelength, auto-skip out-of-range rows)
 - **Automatic peak finding**: `scipy.signal.find_peaks` with prominence/width control, optional log-Y mode, manual point annotation, and **one-click PDF report** (cover + file list + per-file annotated plots & tables)
+- **WAXS crystallinity index**: Gaussian deconvolution of one amorphous halo + N crystalline Bragg peaks (`scipy.optimize.curve_fit`); automatic initial guesses with halo-zone exclusion; single-file preview or batch CI (%) for exposure/dose series; CSV + PDF reports
+- **Degradation kinetics**: first-order decay fitting `y(t) = A·exp(−k·t) + C`, returning rate constant *k*, half-life *t*₁/₂ and R²; CSV or manual input
 - **Multi-function batch processing**: drop third column, compute `X² × Y`, remove `{}` characters — single file or whole directory
 
 ## 🚀 Installation / 安装
@@ -56,12 +58,12 @@ A launcher window appears with three buttons:
 |---|---|
 | 🟢 Integration Tool (SAXS batch) | pyFAI-based batch image integration |
 | 🔵 Plotting Tool (Data Automation) | Waterfall / 3D / contour / slideshow |
-| 🟠 Data Processing | Q→2θ / Peak finder / Batch utilities |
+| 🟠 Data Processing | Q→2θ / Peak finder / Crystallinity / Kinetics / Batch utilities |
 
 > **Calibration first**: use `pyfai-calib2` (launched from inside the Integration Tool) to generate a `.poni` geometry file before integrating images.
 > **积分前请先用 pyfai-calib2 标定几何文件（.poni）。**
 
-📖 Full manuals: [`docs/SynXS_1.0_Manual_EN.docx`](docs/SynXS_1.0_Manual_EN.docx) | [`docs/SynXS_1.0_Manual_CN.docx`](docs/SynXS_1.0_Manual_CN.docx)
+📖 Full manuals: [`SynXS_1.0_Manual_EN.docx`](SynXS_1.0_Manual_EN.docx) | [`SynXS_1.0_Manual_CN.docx`](SynXS_1.0_Manual_CN.docx)
 
 ## 📦 Dependencies / 依赖
 
@@ -69,7 +71,7 @@ A launcher window appears with three buttons:
 |---|---|
 | numpy | Array math |
 | matplotlib | 2D/3D plotting |
-| scipy | Peak finding, interpolation |
+| scipy | Peak finding, interpolation, curve fitting |
 | fabio | Detector image I/O (.tif/.edf/.cbf) |
 | pyFAI | Azimuthal integration |
 | pyvista *(optional)* | Interactive 3D rendering |
@@ -99,4 +101,4 @@ Released under the [MIT License](LICENSE).
 
 ---
 
-*SynXS Data Processing Suite · v1.0*
+*SynXS Data Processing Suite · v1.1*
