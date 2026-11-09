@@ -7,10 +7,14 @@ SynXS Data Processing Suite
 Contains three independent tools:
 1. Integration Tool (SAXS batch processing) – integrate 2D images using pyFAI
 2. Plotting Tool (data automation) – draw 2D waterfall, 3D, filled contour plots, etc.
-3. Data Processing Tool – Q→2θ conversion, automatic peak finding report, multi-function data processing
+3. Data Processing Tool – Q→2θ conversion, automatic peak finding report, multi-function data
+   processing, WAXS crystallinity-index deconvolution and degradation-kinetics fitting
 Shows a selection interface at startup to enter each tool separately.
 
-Supports geometry calibration file formats: .poni, .json, .cfg, .cif
+Supported geometry calibration file format: pyFAI .poni files (native), plus a JSON dictionary
+holding the same pyFAI geometry keys (any extension, e.g. .json or .cfg).
+A CIF file describes a crystal structure, not a detector geometry, and is NOT accepted here;
+it can however be loaded as a *calibrant reference* in the peak-finding tab.
 """
 
 import sys
@@ -26,6 +30,9 @@ import multiprocessing as mp
 from datetime import datetime
 import traceback
 import json
+import re
+
+VERSION = "1.1.1"
 
 # ==================== Set Matplotlib backend (must be before importing pyplot) ====================
 import matplotlib
@@ -132,50 +139,144 @@ try:
 except ImportError:
     PYVISTA_AVAILABLE = False
 
-# ==================== Generic geometry loader (supports .poni / .json / .cfg / .cif) ====================
+# ==================== Generic geometry loader (pyFAI .poni / pyFAI-style JSON) ====================
+GEOMETRY_SUPPORTED_HINT = (
+    "Supported geometry files: a pyFAI .poni file (native), or a JSON dictionary holding the "
+    "same pyFAI keys (detector, dist, poni1, poni2, rot1, rot2, rot3, wavelength). "
+    "A CIF file describes a crystal structure, not a detector geometry, and is not accepted here.")
+
+
 def load_geometry(file_path):
     """
-    Load geometry calibration file, supports .poni / .json / .cfg / .cif etc.
-    First try pyFAI.load(), then try manual JSON parsing or build Geometry.
+    Load a detector-geometry file.
+
+    Supported: pyFAI .poni files, and JSON dictionaries holding the same keys
+    (detector, dist, poni1, poni2, rot1, rot2, rot3, wavelength). The file extension is not
+    what decides: a .json/.cfg file containing such a dictionary works, while a .cif file
+    never does, because a CIF describes a crystal structure and not a detector geometry.
+
+    Raises ValueError with a readable message when the file cannot be parsed.
     """
-    # 1. First try to load with pyFAI directly (supports .poni and some .json)
-    try:
-        ai = pyFAI.load(file_path)
-        return ai
-    except Exception:
-        pass
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == '.cif':
+        raise ValueError("Cannot use a CIF file as a detector geometry: %s\n%s"
+                         % (file_path, GEOMETRY_SUPPORTED_HINT))
 
-    # 2. Try to parse as JSON (for .json / .cfg pure JSON files)
+    errors = []
+    # 1. Native pyFAI loader (.poni, and pyFAI JSON geometry files)
     try:
-        with open(file_path, 'r') as f:
+        return pyFAI.load(file_path)
+    except Exception as e:
+        errors.append("pyFAI.load: %s" % e)
+
+    # 2. JSON dictionary carrying pyFAI geometry keys (any extension)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # If JSON contains typical pyFAI geometry fields, try to build directly
-        ai = pyFAI.AzimuthalIntegrator(**data)
-        return ai
-    except Exception:
-        pass
+        if not isinstance(data, dict):
+            raise TypeError("JSON root is not an object")
+        return pyFAI.AzimuthalIntegrator(**data)
+    except Exception as e:
+        errors.append("JSON dictionary: %s" % e)
 
-    # 3. Try as CIF file (using pyFAI's CIF support or pycifrw)
-    try:
-        # pyFAI may have built-in CIF support
-        ai = pyFAI.load(file_path)  # try again, some pyFAI versions may support
-        return ai
-    except Exception:
-        pass
+    raise ValueError("Unable to parse geometry file: %s\n%s\nDetails: %s"
+                     % (file_path, GEOMETRY_SUPPORTED_HINT, " | ".join(errors)))
 
-    try:
-        from pycifrw import CifFile
-        cf = CifFile(file_path)
-        # Try to extract typical geometry parameters, provide a simple example here
-        # In practice, mapping depends on the CIF content
-        # If parsing fails, raise exception
-        raise NotImplementedError("CIF parsing requires custom mapping, refer to pyFAI documentation")
-    except Exception:
-        pass
 
-    # 4. If all fail, raise clear error
-    raise Exception(f"Unable to parse geometry file: {file_path}\n"
-                     "Supported formats: pyFAI .poni, .json, pure JSON dictionary (.cfg), and some .cif")
+# ==================== Crystallographic reference (CIF) ====================
+def _cif_number(text):
+    """First floating-point number in a CIF value such as '4.1569(3)'."""
+    m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', text or '')
+    return float(m.group(0)) if m else None
+
+
+def _centring_allows(letter, h, k, l):
+    """Systematic-absence rule of the Bravais centring (P, A, B, C, I, F, R)."""
+    letter = (letter or 'P').upper()[:1]
+    if letter == 'P':
+        return True
+    if letter == 'I':
+        return (h + k + l) % 2 == 0
+    if letter == 'F':
+        return abs(h) % 2 == abs(k) % 2 == abs(l) % 2
+    if letter == 'C':
+        return (h + k) % 2 == 0
+    if letter == 'A':
+        return (k + l) % 2 == 0
+    if letter == 'B':
+        return (h + l) % 2 == 0
+    if letter == 'R':
+        return (-h + k + l) % 3 == 0      # obverse hexagonal setting
+    return True
+
+
+def load_calibrant_cif(path, hkl_max=12, d_min=0.8, d_max=60.0):
+    """
+    Read the Bragg reflections of a standard sample from a crystallographic .cif file.
+
+    A CIF describes a crystal structure (unit cell, symmetry, atoms) and NOT a detector
+    geometry, so it is used here as a *calibrant reference*: the returned (q, d, "hkl")
+    triples are drawn on top of a measured curve so that the observed peaks can be indexed.
+    q = 2*pi/d is in A^-1 and does not depend on the wavelength.
+    """
+    values, symbol = {}, ""
+    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            s = line.strip()
+            if not s.startswith('_'):
+                continue
+            parts = s.split(None, 1)
+            key = parts[0].lower()
+            val = parts[1] if len(parts) > 1 else ''
+            if key in ('_cell_length_a', '_cell_length_b', '_cell_length_c',
+                       '_cell_angle_alpha', '_cell_angle_beta', '_cell_angle_gamma'):
+                values[key] = _cif_number(val)
+            elif key in ('_symmetry_space_group_name_h-m', '_space_group_name_h-m_alt',
+                         '_symmetry_space_group_name_h-m_alt'):
+                symbol = val.strip().strip("'\"").strip()
+
+    a = values.get('_cell_length_a')
+    b = values.get('_cell_length_b', a)
+    c = values.get('_cell_length_c', a)
+    if not a or not b or not c:
+        raise ValueError("No unit-cell parameters found in %s" % os.path.basename(path))
+    al = values.get('_cell_angle_alpha') or 90.0
+    be = values.get('_cell_angle_beta') or 90.0
+    ga = values.get('_cell_angle_gamma') or 90.0
+
+    ar, br, gr = np.radians([al, be, ga])
+    G = np.array([[a * a, a * b * np.cos(gr), a * c * np.cos(br)],
+                  [a * b * np.cos(gr), b * b, b * c * np.cos(ar)],
+                  [a * c * np.cos(br), b * c * np.cos(ar), c * c]])
+    Ginv = np.linalg.inv(G)
+    centring = symbol[:1] if symbol else 'P'
+
+    seen, out = {}, []
+    for h in range(-hkl_max, hkl_max + 1):
+        for k in range(-hkl_max, hkl_max + 1):
+            for l in range(-hkl_max, hkl_max + 1):
+                if h == 0 and k == 0 and l == 0:
+                    continue
+                if not _centring_allows(centring, h, k, l):
+                    continue
+                v = np.array([h, k, l], dtype=float)
+                inv_d2 = float(v @ Ginv @ v)
+                if inv_d2 <= 0:
+                    continue
+                d = 1.0 / np.sqrt(inv_d2)
+                if not (d_min <= d <= d_max):
+                    continue
+                srt = tuple(sorted((abs(h), abs(k), abs(l)), reverse=True))
+                key = round(d, 4)
+                if key in seen and seen[key] >= srt:
+                    continue
+                seen[key] = srt
+                out.append((2 * np.pi / d, d, "%d%d%d" % srt))
+    out.sort()
+    if not out:
+        raise ValueError("No reflections found - check the cell parameters in the CIF.")
+    return out
+
 
 # ==================== Plotting tool global variables ====================
 data_waves = {}
@@ -916,11 +1017,26 @@ def draw_2d():
 
                 if len(new_x) != len(orig_x) or not np.allclose(new_x, orig_x, rtol=1e-5):
                     try:
-                        f = interp1d(new_x, new_y, kind='linear', bounds_error=False, fill_value=0.0)
-                        new_y_interp = f(orig_x)
-                        if np.any(np.isnan(new_y_interp)):
-                            messagebox.showwarning("Warning", "Interpolation produced NaN, filled with 0")
-                            new_y_interp = np.nan_to_num(new_y_interp, 0)
+                        # Outside the q-range of the replacement file the intensity is NOT silently
+                        # set to 0 (which would fabricate data). The user decides between a
+                        # constant extension of the nearest measured value and a visible gap (NaN).
+                        f = interp1d(new_x, new_y, kind='linear', bounds_error=False, fill_value=np.nan)
+                        new_y_interp = np.asarray(f(orig_x), dtype=float)
+                        outside = ~np.isfinite(new_y_interp)
+                        n_out = int(np.sum(outside))
+                        if n_out:
+                            hold = messagebox.askyesno(
+                                "Partial overlap",
+                                f"{n_out} of {len(orig_x)} points of curve {i} lie outside the q-range "
+                                f"of the replacement file ({new_x[0]:g} – {new_x[-1]:g}).\n\n"
+                                "Yes  = hold the nearest measured value (continuous curve)\n"
+                                "No   = leave these points empty (visible gap)\n"
+                                "No zero intensity is inserted in either case.")
+                            if hold:
+                                new_y_interp[outside] = np.where(orig_x[outside] < new_x[0],
+                                                                 new_y[0], new_y[-1])
+                            else:
+                                pass  # keep NaN: the curve shows a gap
                     except Exception as e:
                         messagebox.showerror("Error", f"Interpolation failed: {e}")
                         replace_mode = False
@@ -2708,6 +2824,30 @@ class DependencyStatusDialog:
 
 
 # ==================== Integration tool - multi-process safe worker function (outside class) ====================
+def make_dat_header(config, filename, write_sigma):
+    """Self-describing header written into every integrated .dat file (traceability)."""
+    if config.get('use_sector'):
+        az = "%.3f to %.3f deg" % (config.get('azimuth_start', 0.0), config.get('azimuth_end', 0.0))
+    else:
+        az = "full circle"
+    lines = [
+        "# SynXS %s - pyFAI azimuthal integration" % VERSION,
+        "# source_image: %s" % filename,
+        "# geometry_poni: %s" % config.get('poni'),
+        "# mask: %s" % (config.get('mask_file') or "none"),
+        "# background: %s  (scale=%s, shift=%s)" % (config.get('bg_file') or "none",
+                                                    config.get('bg_scale'),
+                                                    config.get('bg_shift')),
+        "# unit: %s   bins: %s   azimuth_range: %s" % (config.get('unit'),
+                                                       config.get('nbins'), az),
+        "# negative_clipping: %s" % ("off" if config.get('allow_negative') else "on (clip at 0)"),
+        "# error_model: %s" % ("poisson (sigma in column 3)" if write_sigma else "none"),
+        "# created: %s" % datetime.now().isoformat(timespec='seconds'),
+        "# columns: %s" % ("q, I, sigma" if write_sigma else "q, I"),
+    ]
+    return "\n".join(lines)
+
+
 def process_images_worker(config, file_list, log_queue, progress_queue, cancel_event):
     """
     Independent worker function running in a subprocess, contains no Tkinter objects.
@@ -2742,6 +2882,8 @@ def process_images_worker(config, file_list, log_queue, progress_queue, cancel_e
         bg_scale = config['bg_scale']
         bg_shift = config['bg_shift']
         allow_negative = config['allow_negative']
+        write_sigma = config.get('write_sigma', True)
+        error_model = 'poisson' if write_sigma else None
         
         log_queue.put("Loading geometry file...")
         ai = load_geometry(poni)
@@ -2797,13 +2939,24 @@ def process_images_worker(config, file_list, log_queue, progress_queue, cancel_e
                 
                 if use_sector:
                     start, end = sorted([azimuth_start, azimuth_end])
-                    x, I = ai.integrate1d(img, nbins, unit=unit, azimuth_range=(start, end))
+                    res = ai.integrate1d(img, nbins, unit=unit, azimuth_range=(start, end),
+                                         error_model=error_model)
                 else:
-                    x, I = ai.integrate1d(img, nbins, unit=unit)
-                
+                    res = ai.integrate1d(img, nbins, unit=unit, error_model=error_model)
+
+                if write_sigma:
+                    x, I, sigma = res
+                else:
+                    x, I = res
+
                 out_file = os.path.join(output_dir, name + ".dat")
-                np.savetxt(out_file, np.column_stack((x, I)),
-                           header=f"# {unit}\tIntensity", comments='')
+                header = make_dat_header(config, filename, write_sigma)
+                if write_sigma:
+                    np.savetxt(out_file, np.column_stack((x, I, sigma)),
+                               header=header, comments='')
+                else:
+                    np.savetxt(out_file, np.column_stack((x, I)),
+                               header=header, comments='')
                 
                 if save_plot:
                     plt.figure(figsize=(6,4))
@@ -2867,6 +3020,7 @@ class SAXSBatchGUI(tk.Toplevel):
         self.bg_scale = tk.DoubleVar(value=1.0)
         self.bg_shift = tk.DoubleVar(value=0.0)
         self.allow_negative = tk.BooleanVar(value=False)
+        self.write_sigma = tk.BooleanVar(value=True)
 
         self.input_mode = tk.StringVar(value="folder")
         self.selected_files = []
@@ -2955,7 +3109,7 @@ class SAXSBatchGUI(tk.Toplevel):
         poni_frame = ttk.Frame(self.inner_frame)
         poni_frame.grid(row=6, column=0, columnspan=3, sticky='ew', pady=5)
         poni_frame.columnconfigure(1, weight=1)
-        ttk.Label(poni_frame, text="Geometry file (.poni/.json/.cfg/.cif):").grid(row=0, column=0, sticky='w', padx=5)
+        ttk.Label(poni_frame, text="Geometry file (.poni / pyFAI .json):").grid(row=0, column=0, sticky='w', padx=5)
         ttk.Entry(poni_frame, textvariable=self.poni_file).grid(row=0, column=1, sticky='ew', padx=5)
         ttk.Button(poni_frame, text="Browse", command=self.browse_poni).grid(row=0, column=2, padx=5)
 
@@ -3015,7 +3169,11 @@ class SAXSBatchGUI(tk.Toplevel):
         self.integrate_preview_btn = ttk.Button(shift_row, text="Integration preview", command=self.open_integrate_preview)
         self.integrate_preview_btn.pack(side='left', padx=5)
 
-        ttk.Checkbutton(self.advanced_frame, text="Allow negative intensity (do not clip to 0)", variable=self.allow_negative).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(self.advanced_frame, text="Allow negative intensity (do not clip to 0)",
+                        variable=self.allow_negative).grid(row=2, column=0, columnspan=2, sticky='w', padx=5, pady=5)
+        ttk.Checkbutton(self.advanced_frame,
+                        text="Write uncertainty column σ (pyFAI Poisson error model)",
+                        variable=self.write_sigma).grid(row=3, column=0, columnspan=2, sticky='w', padx=5, pady=5)
 
         options_frame = ttk.Frame(self.inner_frame)
         options_frame.grid(row=11, column=0, columnspan=3, sticky='ew', pady=5)
@@ -3086,7 +3244,7 @@ class SAXSBatchGUI(tk.Toplevel):
     def browse_poni(self):
         filename = filedialog.askopenfilename(
             title="Select geometry calibration file",
-            filetypes=[("Geometry files", "*.poni *.json *.cfg *.cif"), ("All files", "*.*")]
+            filetypes=[("Geometry files", "*.poni *.json"), ("All files", "*.*")]
         )
         if filename:
             self.poni_file.set(filename)
@@ -3160,9 +3318,15 @@ class SAXSBatchGUI(tk.Toplevel):
 
         def launch_calib():
             try:
-                subprocess.Popen('start cmd /k pyfai-calib2', shell=True)
+                if os.name == 'nt':
+                    # Keep the console window open on Windows only
+                    subprocess.Popen('start cmd /k pyfai-calib2', shell=True)
+                else:
+                    # macOS / Linux: pyfai-calib2 is on PATH after `pip install pyFAI`
+                    subprocess.Popen(['pyfai-calib2'])
             except Exception as e:
-                messagebox.showerror("Error", f"Unable to launch calibration tool: {e}")
+                messagebox.showerror("Error", f"Unable to launch calibration tool: {e}\n"
+                                              "Make sure pyFAI is installed and pyfai-calib2 is on PATH.")
 
         btn_launch = tk.Button(btn_frame, text="Launch calibration tool", command=launch_calib, width=15)
         btn_launch.pack(side='left', padx=10)
@@ -3225,7 +3389,9 @@ class SAXSBatchGUI(tk.Toplevel):
         help_text = """SynXS - SAXS Batch Processing Tool User Guide
 
 1. Calibration: Must use pyFAI-calib2 on a standard sample image to generate geometry file.
-   Supported formats: .poni, .json, .cfg, .cif
+   Supported formats: pyFAI .poni, or a JSON dictionary with the same pyFAI keys.
+   (A .cif file is a crystal structure, not a detector geometry, and is not accepted here;
+    in the peak-finding tab it can be loaded as a calibrant reference instead.)
 
 2. Set parameters:
    - Input mode: Scan folder processes all .tif/.edf/.cbf files in the folder;
@@ -3305,6 +3471,7 @@ For issues, contact the author."""
             'bg_scale': self.bg_scale.get(),
             'bg_shift': self.bg_shift.get(),
             'allow_negative': self.allow_negative.get(),
+            'write_sigma': self.write_sigma.get(),
         }
 
         if self.input_mode.get() == "folder":
@@ -3562,6 +3729,12 @@ class PeakFinderTab(ttk.Frame):
         self.peak_results = {}
         self.manual_points = {}
 
+        # optional crystallographic reference (CIF) overlaid on the plot
+        self.calibrant = None            # list of (q, d, "hkl")
+        self.calibrant_name = ""
+        self.calibrant_mode = "q"        # "q" or "2th"
+        self.calibrant_wavelength = 1.5406
+
         self.init_ui()
         self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
 
@@ -3615,6 +3788,18 @@ class PeakFinderTab(ttk.Frame):
         ttk.Button(left_frame, text="Preview current file", command=self.preview_peaks).pack(fill=tk.X, pady=2)
         ttk.Button(left_frame, text="One-click peak find (all files)", command=self.batch_find_peaks).pack(fill=tk.X, pady=2)
         ttk.Button(left_frame, text="Export peak plots to PDF", command=self.export_peaks_to_pdf).pack(fill=tk.X, pady=2)
+
+        cal_frame = ttk.LabelFrame(left_frame, text="Crystallographic reference", padding=5)
+        cal_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(cal_frame, text="Overlay the Bragg positions of a standard\n"
+                                  "sample (.cif: LaB₆, CeO₂, Si, AgBh …)",
+                  foreground="gray", font=('Helvetica', 8)).pack(anchor=tk.W)
+        ttk.Button(cal_frame, text="Load calibrant (.cif)…",
+                   command=self.load_calibrant).pack(fill=tk.X, pady=2)
+        ttk.Button(cal_frame, text="Clear calibrant",
+                   command=self.clear_calibrant).pack(fill=tk.X, pady=2)
+        self.calibrant_label = ttk.Label(cal_frame, text="no calibrant", foreground="gray")
+        self.calibrant_label.pack(anchor=tk.W)
 
         add_point_frame = ttk.LabelFrame(left_frame, text="Manual point addition", padding=5)
         add_point_frame.pack(fill=tk.X, pady=5)
@@ -3739,11 +3924,70 @@ class PeakFinderTab(ttk.Frame):
             self.plot_data(x, y_plot, title=title, ylabel=ylabel)
             self.status_label.config(text=f"Loaded: {os.path.basename(file_path)} (no peaks)")
 
+    # ---------- crystallographic reference (CIF) ----------
+    def load_calibrant(self):
+        path = filedialog.askopenfilename(
+            title="Select a crystallographic .cif file for the calibrant",
+            filetypes=[("CIF files", "*.cif *.CIF"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            marks = load_calibrant_cif(path)
+        except Exception as e:
+            messagebox.showerror("Calibrant error", "%s" % e)
+            return
+        mode = ask_choice("Calibrant axis", "The x-axis of your .dat files is:",
+                          ["q (Å⁻¹)", "2θ (deg)"], 0)
+        self.calibrant_mode = "2th" if (mode or "").startswith("2θ") else "q"
+        if self.calibrant_mode == "2th":
+            wl = ask_number("Wavelength", "X-ray wavelength (Å):", default=1.5406, vartype=float)
+            if wl:
+                self.calibrant_wavelength = float(wl)
+        self.calibrant = marks
+        self.calibrant_name = os.path.basename(path)
+        self.calibrant_label.config(text="%s (%d reflections)"
+                                    % (self.calibrant_name, len(marks)), foreground="black")
+        if self.current_data is not None:
+            self.draw_current_file()
+
+    def clear_calibrant(self):
+        self.calibrant = None
+        self.calibrant_name = ""
+        self.calibrant_label.config(text="no calibrant", foreground="gray")
+        if self.current_data is not None:
+            self.draw_current_file()
+
+    def _calibrant_marks(self):
+        """[(hkl, x)] positions of the reference reflections on the current x-axis."""
+        if not self.calibrant:
+            return []
+        out = []
+        for q, d, hkl in self.calibrant:
+            if self.calibrant_mode == "q":
+                out.append((hkl, q))
+            else:
+                arg = q * self.calibrant_wavelength / (4 * np.pi)
+                if 0 < arg <= 1:
+                    out.append((hkl, float(np.degrees(2 * np.arcsin(arg)))))
+        return out
+
+    def _overlay_calibrant(self, ax):
+        marks = self._calibrant_marks()
+        if not marks:
+            return
+        lo, hi = ax.get_xlim()
+        for hkl, xv in marks:
+            if lo <= xv <= hi:
+                ax.axvline(xv, color="0.55", ls=(0, (4, 3)), lw=0.8, zorder=0)
+                ax.annotate(hkl, xy=(xv, 0.995), xycoords=("data", "axes fraction"),
+                            rotation=90, fontsize=6, color="0.45", ha="right", va="top")
+
     def plot_data(self, x, y, peaks=None, title="Data", ylabel="Y"):
         self.ax.clear()
         self.ax.plot(x, y, 'b-', linewidth=1)
         if peaks is not None and len(peaks) > 0:
             self.ax.plot(x[peaks], y[peaks], 'ro', markersize=5, label='Peaks')
+        self._overlay_calibrant(self.ax)
         # title font 10pt
         self.ax.set_title(title, fontsize=10)
         self.ax.set_xlabel("X")
@@ -3758,6 +4002,7 @@ class PeakFinderTab(ttk.Frame):
         self.ax.clear()
         self.ax.plot(x, y_plot, 'b-', linewidth=1)
         self.ax.plot(x[peaks], y_plot[peaks], 'ro', markersize=5, label='Peaks')
+        self._overlay_calibrant(self.ax)
 
         prominences = properties['prominences']
         widths_x = self.compute_widths_in_x(x, properties)
@@ -4169,8 +4414,10 @@ class DataProcessTab(ttk.Frame):
 
         ttk.Radiobutton(op_frame, text="Drop third column (keep first two)", variable=self.operation,
                         value="drop").grid(row=0, column=0, sticky=tk.W, padx=5)
-        ttk.Radiobutton(op_frame, text="Calculate new column (first column² × second)", variable=self.operation,
-                        value="calc").grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Radiobutton(op_frame, text="Kratky transform  (column1² × column2, i.e. q²·I)", variable=self.operation,
+                        value="calc_kratky").grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Radiobutton(op_frame, text="Porod transform  (column1⁴ × column2, i.e. q⁴·I)", variable=self.operation,
+                        value="calc_porod").grid(row=1, column=1, sticky=tk.W, padx=5)
         ttk.Radiobutton(op_frame, text="Remove braces (delete all { } characters)", variable=self.operation,
                         value="remove_braces").grid(row=0, column=2, sticky=tk.W, padx=5)
 
@@ -4317,8 +4564,9 @@ class DataProcessTab(ttk.Frame):
                         except ValueError:
                             self.log(f"Error: file {input_path} line {line_num} first two columns contain non-numeric data, skipped")
                             continue
-                        # Calculate new value: first column squared × second column
-                        new_val = (col1 ** 2) * col2
+                        # Kratky: q²·I(q)   Porod: q⁴·I(q)
+                        power = 2 if operation == "calc_kratky" else 4
+                        new_val = (col1 ** power) * col2
                         new_line = f"{parts[0]} {new_val}"
 
                     fout.write(new_line + "\n")
