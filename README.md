@@ -10,12 +10,15 @@
 
 ### 1. Integration Tool — SAXS Batch Processing (pyFAI)
 - Batch integrate 2D detector images (`.tif` / `.edf` / `.cbf`) into 1D curves
-- Geometry calibration formats: `.poni`, `.json`, `.cfg`, `.cif`
+- Geometry files: pyFAI `.poni`, or a JSON dictionary with the same pyFAI keys (`.json` / `.cfg`). A `.cif` describes a crystal structure, not a detector geometry, and is **not** accepted as one — it can be loaded as a *calibrant reference* in the peak-finding tab instead
 - Background subtraction (scale + shift) with **real-time shift preview**
 - Optional mask file, sector (azimuth-limited) integration
+- Optional third column with the **Poisson uncertainty σ** (`error_model='poisson'`)
+- Every output `.dat` carries a **self-describing header** (geometry, mask, background parameters, binning, azimuth range, error model, version, timestamp)
 - Multi-processing engine — isolated worker prevents memory leaks
 - Optional per-file PNG plot export + full processing log
 - **Integration Preview**: overlay integrated curves of selected images
+- `benchmark.py` — per-frame timing breakdown (read / integrate / write / PNG), the numbers reported in the paper
 
 ### 2. Plotting Tool — Data Automation
 - Batch import `.dat` files with custom prefix naming
@@ -27,10 +30,10 @@
 
 ### 3. Data Processing Tool
 - **Q → 2θ conversion** (custom wavelength, auto-skip out-of-range rows)
-- **Automatic peak finding**: `scipy.signal.find_peaks` with prominence/width control, optional log-Y mode, manual point annotation, and **one-click PDF report** (cover + file list + per-file annotated plots & tables)
+- **Automatic peak finding**: `scipy.signal.find_peaks` with prominence/width control, optional log-Y mode, manual point annotation, and **one-click PDF report** (cover + file list + per-file annotated plots & tables). A **crystallographic `.cif`** of a standard sample (LaB₆, CeO₂, Si, AgBh …) can be overlaid as reference: the allowed reflections are computed from the unit cell and Bravais centring and drawn with their *(hkl)* labels, in q or 2θ
 - **WAXS crystallinity index**: Gaussian deconvolution of one amorphous halo + N crystalline Bragg peaks (`scipy.optimize.curve_fit`); automatic initial guesses with halo-zone exclusion; single-file preview or batch CI (%) for exposure/dose series; CSV + PDF reports
 - **Degradation kinetics**: first-order decay fitting `y(t) = A·exp(−k·t) + C`, returning rate constant *k*, half-life *t*₁/₂ and R²; CSV or manual input
-- **Multi-function batch processing**: drop third column, compute `X² × Y`, remove `{}` characters — single file or whole directory
+- **Multi-function batch processing**: drop third column, **Kratky** (`q²·I`) or **Porod** (`q⁴·I`) transform, remove `{}` characters — single file or whole directory
 
 ## 🚀 Installation / 安装
 
